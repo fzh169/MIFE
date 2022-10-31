@@ -13,7 +13,7 @@ class MyModel(nn.Module):
         self.args = args
 
         self.fe = FeatureExtractor(dim=(32, 64, 128, 256))
-        # self.sn = ScoreNet(dim=(16, 32, 64, 96), in_ch=27, out_ch=9, kernel=3, dilation=(2, 4, 8))
+        self.sn = ScoreNet(dim=(16, 32, 64, 96), in_ch=27, out_ch=9, kernel=3, dilation=(2, 4, 8))
 
         self.flow0 = RefineFlow(dim=64,  part_size=8,  kernel=3, dilation=2)
         self.flow1 = RefineFlow(dim=128, part_size=16, kernel=3, dilation=4)
@@ -21,6 +21,9 @@ class MyModel(nn.Module):
 
         self.fn = FusionNet(dim=(16, 32, 64, 96), in_ch=2, out_ch=2)
         self.mn = MaskNet(dim=32, in_ch=1)
+
+        self.ce = ContextExtractor(dim=(16, 32, 64, 96))
+        self.sy = SynthesisNet(dim=((16, 32, 64, 96), (96, 192, 288)), in_ch=17, out_ch=3)
 
     def forward(self, frame0, frame2):
         h0 = int(list(frame0.size())[2])
@@ -47,19 +50,33 @@ class MyModel(nn.Module):
         feat00, feat10, feat20 = self.fe(nf0)
         feat02, feat12, feat22 = self.fe(nf2)
 
-        # score00, score10, score20 = self.sn(nf0)
-        # score02, score12, score22 = self.sn(nf2)
+        score00, score10, score20 = self.sn(nf0)
+        score02, score12, score22 = self.sn(nf2)
 
-        flow10_0, flow12_0, flow02_0, flow20_0, range0_0, range1_0 = self.flow0(feat00, feat02)
-        flow10_1, flow12_1, flow02_1, flow20_1, range0_1, range1_1 = self.flow1(feat10, feat12)
-        flow10_2, flow12_2, flow02_2, flow20_2, range0_2, range1_2 = self.flow2(feat20, feat22)
+        flow10_0, flow12_0, flow02_0, flow20_0, range0_0, range1_0 = self.flow0(feat00, feat02, score00, score02)
+        flow10_1, flow12_1, flow02_1, flow20_1, range0_1, range1_1 = self.flow1(feat10, feat12, score10, score12)
+        flow10_2, flow12_2, flow02_2, flow20_2, range0_2, range1_2 = self.flow2(feat20, feat22, score20, score22)
 
         flow10 = self.fn(flow10_0, flow10_1, flow10_2, range1_0, range1_1)
         flow12 = self.fn(flow12_0, flow12_1, flow12_2, range1_0, range1_1)
         flow02 = self.fn(flow02_0, flow02_1, flow02_2, range0_0, range0_1)
         flow20 = self.fn(flow20_0, flow20_1, flow20_2, range0_0, range0_1)
 
-        frame1_hat = self.generate(flow10, flow12, flow02, flow20, frame0, frame2)[:, :, 0:h0, 0:w0]
+        # frame1_hat = self.generate(flow10, flow12, flow02, flow20, frame0, frame2)[:, :, 0:h0, 0:w0]
+
+        f10 = self.backwarp(flow10, frame0)
+        f12 = self.backwarp(flow12, frame2)
+
+        rad02 = (flow02[:, 0] ** 2 + flow02[:, 1] ** 2 + 1e-6) ** 0.5
+        rad20 = (flow20[:, 0] ** 2 + flow20[:, 1] ** 2 + 1e-6) ** 0.5
+
+        alpha = self.mn((rad20 - rad02).unsqueeze(1))
+        frame1_hat = alpha * f10 + (1 - alpha) * f12
+
+        c0 = self.ce(frame0, flow10)
+        c1 = self.ce(frame2, flow12)
+        res = self.sy(torch.cat([frame0, frame2, f10, f12, flow10, flow12, alpha], dim=1), c0, c1) * 2 - 1
+        frame1_hat = torch.clamp(frame1_hat + res, 0, 1)[:, :, 0:h0, 0:w0]
 
         if self.training:
 
@@ -73,23 +90,18 @@ class MyModel(nn.Module):
 
     def generate(self, flow10, flow12, flow02, flow20, frame0, frame2):
 
-        f10 = self.sample(flow10, frame0)
-        f12 = self.sample(flow12, frame2)
+        f10 = self.backwarp(flow10, frame0)
+        f12 = self.backwarp(flow12, frame2)
 
         rad02 = (flow02[:, 0] ** 2 + flow02[:, 1] ** 2 + 1e-6) ** 0.5
         rad20 = (flow20[:, 0] ** 2 + flow20[:, 1] ** 2 + 1e-6) ** 0.5
 
         alpha = self.mn((rad20 - rad02).unsqueeze(1))
         frame1_hat = alpha * f10 + (1 - alpha) * f12
-
-        # a = alpha.squeeze(0).squeeze(0).cpu().detach().numpy()
-        # plt.imshow(a)
-        # plt.savefig("mask.png")
-        # plt.show()
-
+        
         return frame1_hat
 
-    def sample(self, flow, frame):
+    def backwarp(self, flow, frame):
 
         B, _, H, W = flow.shape
 
@@ -122,7 +134,7 @@ class BasicFlow(nn.Module):
 
         self.proj = nn.Conv2d(in_channels=dim, out_channels=dim, kernel_size=3, stride=1, padding=1)
 
-    def forward(self, feat0, feat2):
+    def forward(self, feat0, feat2, score0, score2):
 
         B, C, H, W = feat0.shape
 
@@ -203,24 +215,6 @@ class BasicFlow(nn.Module):
 
         corr, base = self.select(corr)
         flow, corr, range1 = self.flow(corr, pos, True, base)
-        flow = flow * 2
-        range1 = range1 * 2
-
-        corr = torch.cat([corr[:, :, :-1, :-1], corr[:, :, :-1, 1:], corr[:, :, 1:, :-1], corr[:, :, 1:, 1:]], dim=1)
-        flow = torch.cat([flow[:, :, :-1, :-1], flow[:, :, :-1, 1:], flow[:, :, 1:, :-1], flow[:, :, 1:, 1:]], dim=1)
-
-        flow = rearrange(flow, 'b (n f) h w -> b f n h w', f=2)
-
-        smax = torch.softmax(corr, dim=1)
-        corr = torch.sum(corr * smax, dim=1, keepdim=True)
-        flow = torch.sum(flow * smax.unsqueeze(1), dim=2)
-
-        range1 = torch.cat([range1[:, :, :-1, :-1], range1[:, :, :-1, 1:], range1[:, :, 1:, :-1], range1[:, :, 1:, 1:]],
-                           dim=1)
-        range1 = rearrange(range1, 'b (n f) h w -> b f n h w', f=2)
-
-        range1 = torch.min(range1, dim=2)[0]
-        range1 = torch.cat([-range1, range1], dim=1)
 
         range0 = range0.repeat(flow.size()[0], 1, 1, 1)
         range1 = range1.repeat(flow.size()[0], 1, 1, 1)
@@ -270,10 +264,27 @@ class BasicFlow(nn.Module):
             maxx = torch.max(flow.clone().detach(), dim=3)[0]
             minn = torch.min(flow.clone().detach(), dim=3)[0]
             range = torch.min(torch.stack([maxx, -minn], dim=3), dim=3)[0]
+
+            corr = rearrange(corr, 'b (h w) t -> b h w t', h=bh).unsqueeze(1)
+            flow = rearrange(flow, 'b f (h w) t -> b f h w t', h=bh)
+            range = rearrange(range, 'b f (h w) -> b f h w', h=bh)
+            bh = bh - 1
+
+            corr = torch.cat([corr[:, :, :-1, :-1], corr[:, :, :-1, 1:], corr[:, :, 1:, :-1], corr[:, :, 1:, 1:]], dim=1)
+            flow = torch.cat([flow[:, :, :-1, :-1], flow[:, :, :-1, 1:], flow[:, :, 1:, :-1], flow[:, :, 1:, 1:]], dim=1)
+            corr = rearrange(corr, 'b n h w t -> b (h w) (n t)')
+            flow = rearrange(flow, 'b (n f) h w t -> b f (h w) (n t)', f=2) * 2
+
+            range = torch.cat([range[:, :, :-1, :-1], range[:, :, :-1, 1:], range[:, :, 1:, :-1], range[:, :, 1:, 1:]], dim=1)
+            range = rearrange(range, 'b (n f) h w -> b f n h w', f=2)
+
+            range = torch.min(range, dim=2)[0]
+            range = torch.cat([-range, range], dim=1) * 2
         else:
             maxx = torch.max(flow.clone().detach(), dim=3)[0]
             minn = torch.min(flow.clone().detach(), dim=3)[0]
             range = torch.cat([minn, maxx], dim=1)
+            range = rearrange(range, 'b f (h w) -> b f h w', h=bh)
 
         smax = torch.softmax(corr, dim=2)
         corr = torch.sum(corr * smax, dim=2)
@@ -281,7 +292,6 @@ class BasicFlow(nn.Module):
 
         corr = rearrange(corr, 'b (h w) -> b h w', h=bh).unsqueeze(1)
         flow = rearrange(flow, 'b f (h w) -> b f h w', h=bh)
-        range = rearrange(range, 'b f (h w) -> b f h w', h=bh)
 
         return flow, corr, range
 
@@ -339,7 +349,7 @@ class RefineFlow(BasicFlow):
 
         self.proj = nn.Conv2d(in_channels=dim, out_channels=dim, kernel_size=3, stride=1, padding=1)
 
-    def forward(self, feat0, feat2):
+    def forward(self, feat0, feat2, score0, score2):
 
         B, C, H, W = feat0.shape
 
@@ -382,10 +392,10 @@ class RefineFlow(BasicFlow):
         factor1 = int(self.dilation / 2)
         factor0 = self.dilation
 
-        flow10 = self.refine(flow10, corr10, factor1)
-        flow12 = self.refine(flow12, corr12, factor1)
-        flow02 = self.refine(flow02, corr02, factor0)
-        flow20 = self.refine(flow20, corr20, factor0)
+        flow10 = self.refine(flow10, corr10, score0, factor1, False)
+        flow12 = self.refine(flow12, corr12, score2, factor1, False)
+        flow02 = self.refine(flow02, corr02, score0, factor0, True)
+        flow20 = self.refine(flow20, corr20, score2, factor0, True)
 
         if factor0 != 1:
             range0 = repeat(range0, 'b f h w -> b f (h n1) (w n2)', n1=factor0, n2=factor0) * factor0
@@ -394,7 +404,7 @@ class RefineFlow(BasicFlow):
 
         return flow10, flow12, flow02, flow20, range0, range1
 
-    def refine(self, flow, corr, factor):
+    def refine(self, flow, corr, score, factor, target):
 
         if factor != 1:
             flow = repeat(flow, 'b f h w -> b f (h n1) (w n2)', n1=factor, n2=factor) * factor
@@ -407,13 +417,11 @@ class RefineFlow(BasicFlow):
         flow = rearrange(flow, 'b (f k) (h w) -> b f k h w', f=2, h=H)
         corr = rearrange(corr, 'b k (h w) -> b k h w', h=H)
 
-        smax = torch.softmax(corr, dim=1)
-        flow = torch.sum(flow * smax.unsqueeze(1), dim=2)
+        if not target:
+            score = self.sample(flow, score)
 
-        # max1 = torch.max(smax, dim=1)[1].cpu().numpy()
-        # a = max1.squeeze(0)
-        # plt.imshow(a)
-        # plt.show()
+        smax = torch.softmax(score * corr, dim=1)
+        flow = torch.sum(flow * smax.unsqueeze(1), dim=2)
 
         return flow
 
@@ -495,21 +503,6 @@ class ScoreNet(nn.Module):
         score1 = self.snet(feat1)
         score2 = self.snet(feat2)
 
-        # max1 = torch.max(score0, dim=1)[1].cpu().numpy()
-        # a = max1.squeeze(0)
-        # plt.imshow(a)
-        # plt.show()
-        #
-        # max1 = torch.max(score1, dim=1)[1].cpu().numpy()
-        # a = max1.squeeze(0)
-        # plt.imshow(a)
-        # plt.show()
-        #
-        # max1 = torch.max(score2, dim=1)[1].cpu().numpy()
-        # a = max1.squeeze(0)
-        # plt.imshow(a)
-        # plt.show()
-
         return score0, score1, score2
 
     def snet(self, frame):
@@ -567,14 +560,6 @@ class FusionNet(nn.Module):
         mask1 = self.conv(mask1)
         flow0 = flow1 * mask1 + flow0 * (1 - mask1)
 
-        # a2 = mask2.squeeze(0).squeeze(0).cpu().detach().numpy()
-        # plt.imshow(a2)
-        # plt.show()
-        #
-        # a1 = mask1.squeeze(0).squeeze(0).cpu().detach().numpy()
-        # plt.imshow(a1)
-        # plt.show()
-
         return self.fnet(flow0)
 
     def fnet(self, flow):
@@ -609,6 +594,85 @@ class MaskNet(nn.Module):
         return out
 
 
+class ContextExtractor(nn.Module):
+    def __init__(self, dim):
+        super(ContextExtractor, self).__init__()
+
+        self.emb = nn.Conv2d(in_channels=3, out_channels=dim[0], kernel_size=3, stride=1, padding=1)
+        self.ce0 = CEBlock(dim[0], dim[1])
+        self.ce1 = CEBlock(dim[1], dim[2])
+        self.ce2 = CEBlock(dim[2], dim[3])
+
+    def forward(self, frame, flow):
+
+        feat0 = self.ce0(self.emb(frame))
+        flow = F.interpolate(flow, scale_factor=0.5, mode="bilinear", align_corners=False, recompute_scale_factor=False) * 0.5
+        f0 = self.backwarp(flow, feat0)
+
+        feat1 = self.ce1(feat0)
+        flow = F.interpolate(flow, scale_factor=0.5, mode="bilinear", align_corners=False, recompute_scale_factor=False) * 0.5
+        f1 = self.backwarp(flow, feat1)
+
+        feat2 = self.ce2(feat1)
+        flow = F.interpolate(flow, scale_factor=0.5, mode="bilinear", align_corners=False, recompute_scale_factor=False) * 0.5
+        f2 = self.backwarp(flow, feat2)
+
+        return [f0, f1, f2]
+
+    def backwarp(self, flow, feat):
+
+        B, _, H, W = flow.shape
+
+        bx = torch.arange(0.0, W, device="cuda")
+        by = torch.arange(0.0, H, device="cuda")
+        meshy, meshx = torch.meshgrid(by, bx)
+        base = torch.stack((meshx, meshy), dim=0).unsqueeze(0)
+
+        coords = base + flow
+
+        x = coords[:, 0]
+        y = coords[:, 1]
+
+        x = 2 * (x / (W - 1.0) - 0.5)
+        y = 2 * (y / (H - 1.0) - 0.5)
+        grid = torch.stack((x, y), dim=3)
+
+        feat = F.grid_sample(feat, grid, mode='bilinear', padding_mode='border', align_corners=True)
+
+        return feat
+
+
+class SynthesisNet(nn.Module):
+    def __init__(self, dim, in_ch, out_ch):
+        super(SynthesisNet, self).__init__()
+
+        self.init = ResBlock(in_ch, dim[0][0])
+
+        self.sd0 = DownBlock(dim[0][0], dim[0][1])
+        self.sd1 = DownBlock(dim[1][0], dim[0][2])
+        self.sd2 = DownBlock(dim[1][1], dim[0][3])
+
+        self.su2 = UpBlock(dim[1][2], dim[0][2])
+        self.su1 = UpBlock(dim[0][2], dim[0][1])
+        self.su0 = UpBlock(dim[0][1], dim[0][0])
+
+        self.last = nn.Conv2d(in_channels=dim[0][0], out_channels=out_ch, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, feat, c0, c1):
+
+        feat00 = self.init(feat)
+
+        feat01 = self.sd0(feat00)
+        feat02 = self.sd1(torch.cat([feat01, c0[0], c1[0]], dim=1))
+        feat03 = self.sd2(torch.cat([feat02, c0[1], c1[1]], dim=1))
+
+        feat12 = self.su2(torch.cat([feat03, c0[2], c1[2]], dim=1), feat02)
+        feat11 = self.su1(feat12, feat01)
+        feat10 = self.su0(feat11, feat00)
+
+        return torch.sigmoid(self.last(feat10))
+
+
 class FEBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
         super(FEBlock, self).__init__()
@@ -624,6 +688,23 @@ class FEBlock(nn.Module):
         feat = self.down(feat)
         feat = self.conv(feat)
         feat = self.norm(feat.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+        return feat
+
+
+class CEBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super(CEBlock, self).__init__()
+
+        self.down = nn.Sequential(
+            nn.Conv2d(in_channels=in_ch, out_channels=out_ch, kernel_size=2, stride=2),
+            nn.PReLU()
+        )
+        self.conv = ResBlock(out_ch, out_ch)
+
+    def forward(self, feat):
+        feat = self.down(feat)
+        feat = self.conv(feat)
 
         return feat
 
